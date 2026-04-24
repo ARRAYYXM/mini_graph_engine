@@ -60,7 +60,54 @@ type Symbol struct {
 	IsVisible  bool
 }
 
+// SymbolTable 是 Semantic Analysis 的显式产物，供外部（如 Planner）查询。
+// 它记录了查询中所有变量的声明信息，以及每个 clause 执行后暴露的变量集合。
+type SymbolTable struct {
+	// All 是所有在查询中声明过的变量的全局索引。
+	// 即使某个变量在后续 clause 中不可见，它仍然在这里有记录。
+	All map[string]*Symbol
+
+	// ClauseResult 记录每个 clause 执行后"暴露给下游"的变量集合。
+	// Planner 用这个信息来决定算子之间的数据流（pipeline）。
+	// 例如：
+	//   MatchClause -> {a: Node, b: Node}
+	//   WithClause  -> {b: Node, friend_count: Aggregate}
+	ClauseResult map[ast.Clause]map[string]*Symbol
+}
+
+func NewSymbolTable() *SymbolTable {
+	return &SymbolTable{
+		All:          make(map[string]*Symbol),
+		ClauseResult: make(map[ast.Clause]map[string]*Symbol),
+	}
+}
+
+// Lookup 按变量名查找符号。
+func (st *SymbolTable) Lookup(name string) *Symbol {
+	return st.All[name]
+}
+
+// ResultOf 获取某个 clause 执行后暴露的变量集合。
+func (st *SymbolTable) ResultOf(clause ast.Clause) map[string]*Symbol {
+	return st.ClauseResult[clause]
+}
+
+// ListByKind 按类型列出所有符号。
+func (st *SymbolTable) ListByKind(kind SymbolKind) []*Symbol {
+	var result []*Symbol
+	for _, sym := range st.All {
+		if sym.Kind == kind {
+			result = append(result, sym)
+		}
+	}
+	return result
+}
+
 // -------------------- 2. 作用域 --------------------
+//
+// Scope 是 SymbolTable 的"运行时"实现。
+// 在分析过程中，Scope 负责管理变量在当前作用域中的可见性。
+// 分析完成后，所有符号信息被汇总到 SymbolTable 中，供后续阶段使用。
 
 type Scope struct {
 	Parent  *Scope
@@ -106,7 +153,10 @@ type SemanticAnalyzer struct {
 	currentScope *Scope
 	scopes       []*Scope
 	errors       []SemanticError
-	ClauseResult map[ast.Clause]map[string]*Symbol
+
+	// SymbolTable 是 Semantic Analysis 的显式产物。
+	// 分析完成后，外部（如 Planner）可以直接读取这个表。
+	SymbolTable *SymbolTable
 }
 
 func NewAnalyzer() *SemanticAnalyzer {
@@ -115,7 +165,7 @@ func NewAnalyzer() *SemanticAnalyzer {
 		currentScope: root,
 		scopes:       []*Scope{root},
 		errors:       []SemanticError{},
-		ClauseResult: make(map[ast.Clause]map[string]*Symbol),
+		SymbolTable:  NewSymbolTable(),
 	}
 }
 
@@ -126,6 +176,20 @@ func (sa *SemanticAnalyzer) Analyze(q *ast.Query) []SemanticError {
 		}
 	}
 	return sa.errors
+}
+
+// declare 封装了 Scope.Declare，同时把符号记录到全局 SymbolTable。
+// SymbolTable.All 只记录变量的"首次声明"位置。如果同一个变量名在后续 clause
+// 中重新声明（如 WITH 投影中的 b），不会覆盖首次声明的记录。
+func (sa *SemanticAnalyzer) declare(name string, kind SymbolKind, at ast.Clause) error {
+	err := sa.currentScope.Declare(name, kind, at)
+	if err == nil {
+		// 只记录首次声明，不覆盖（WITH 中的投影变量只是传递，不是重新定义）
+		if _, exists := sa.SymbolTable.All[name]; !exists {
+			sa.SymbolTable.All[name] = sa.currentScope.Resolve(name)
+		}
+	}
+	return err
 }
 
 func (sa *SemanticAnalyzer) pushScope() {
@@ -190,7 +254,7 @@ func (sa *SemanticAnalyzer) analyzeCreate(cc *ast.CreateClause) {
 
 func (sa *SemanticAnalyzer) analyzeUnwind(uc *ast.UnwindClause) {
 	sa.analyzeExpression(uc.Expression, uc)
-	if err := sa.currentScope.Declare(uc.Alias, KindList, uc); err != nil {
+	if err := sa.declare(uc.Alias, KindList, uc); err != nil {
 		sa.addError(err.Error(), uc)
 	}
 	sa.recordResult(uc)
@@ -238,14 +302,14 @@ func (sa *SemanticAnalyzer) analyzePattern(pat *ast.Pattern, clause ast.Clause) 
 func (sa *SemanticAnalyzer) analyzePatternElement(elem *ast.PatternElement, clause ast.Clause) {
 	for i, node := range elem.Nodes {
 		if node.Variable != "" {
-			if err := sa.currentScope.Declare(node.Variable, KindNode, clause); err != nil {
+			if err := sa.declare(node.Variable, KindNode, clause); err != nil {
 				sa.addError(err.Error(), clause)
 			}
 		}
 		if i < len(elem.Rels) {
 			rel := elem.Rels[i]
 			if rel.Variable != "" {
-				if err := sa.currentScope.Declare(rel.Variable, KindEdge, clause); err != nil {
+				if err := sa.declare(rel.Variable, KindEdge, clause); err != nil {
 					sa.addError(err.Error(), clause)
 				}
 			}
@@ -297,7 +361,7 @@ func (sa *SemanticAnalyzer) analyzeWith(wc *ast.WithClause) {
 			sa.addError("projection must have an alias or be a simple variable", wc)
 			continue
 		}
-		if err := sa.currentScope.Declare(meta.name, meta.kind, wc); err != nil {
+		if err := sa.declare(meta.name, meta.kind, wc); err != nil {
 			sa.addError(err.Error(), wc)
 		}
 	}
@@ -386,7 +450,7 @@ func (sa *SemanticAnalyzer) analyzeExpression(expr ast.Expression, clause ast.Cl
 			sa.analyzeExpression(e.ElseExpr, clause)
 		}
 	case *ast.ListComprehensionExpr:
-		if err := sa.currentScope.Declare(e.Variable, KindScalar, clause); err != nil {
+		if err := sa.declare(e.Variable, KindScalar, clause); err != nil {
 			sa.addError(err.Error(), clause)
 		}
 		sa.analyzeExpression(e.InExpr, clause)
@@ -524,7 +588,7 @@ func (sa *SemanticAnalyzer) recordResult(clause ast.Clause) {
 	for name, sym := range sa.currentScope.Symbols {
 		exported[name] = sym
 	}
-	sa.ClauseResult[clause] = exported
+	sa.SymbolTable.ClauseResult[clause] = exported
 }
 
 // -------------------- 8. 结果打印 --------------------
@@ -540,8 +604,16 @@ func (sa *SemanticAnalyzer) PrintResults() {
 		}
 	}
 
-	fmt.Println("\n--- Clause Results (exported symbols) ---")
-	for clause, syms := range sa.ClauseResult {
+	fmt.Println("\n--- SymbolTable.All (all declared variables) ---")
+	if len(sa.SymbolTable.All) == 0 {
+		fmt.Println("  (empty)")
+	}
+	for name, sym := range sa.SymbolTable.All {
+		fmt.Printf("   %-15s -> %s (introduced in %s)\n", name, sym.Kind, clauseName(sym.Introduced))
+	}
+
+	fmt.Println("\n--- SymbolTable.ClauseResult (exported symbols per clause) ---")
+	for clause, syms := range sa.SymbolTable.ClauseResult {
 		var name string
 		switch clause.(type) {
 		case *ast.MatchClause:
@@ -576,6 +648,31 @@ func (sa *SemanticAnalyzer) PrintResults() {
 	}
 	for i := len(chain) - 1; i >= 0; i-- {
 		printScope(chain[i], len(chain)-1-i)
+	}
+}
+
+func clauseName(c ast.Clause) string {
+	switch c.(type) {
+	case *ast.MatchClause:
+		return "MATCH"
+	case *ast.WithClause:
+		return "WITH"
+	case *ast.ReturnClause:
+		return "RETURN"
+	case *ast.CreateClause:
+		return "CREATE"
+	case *ast.UnwindClause:
+		return "UNWIND"
+	case *ast.DeleteClause:
+		return "DELETE"
+	case *ast.SetClause:
+		return "SET"
+	case *ast.RemoveClause:
+		return "REMOVE"
+	case *ast.MergeClause:
+		return "MERGE"
+	default:
+		return "?"
 	}
 }
 
