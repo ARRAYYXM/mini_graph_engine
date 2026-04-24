@@ -4,9 +4,6 @@ tools/
 *.interp
 *.tokens
 
-# Nested git repo (original grammar source)
-grammars-v4/
-
 # IDE
 .idea/
 .vscode/
