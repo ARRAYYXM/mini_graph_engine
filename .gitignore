@@ -6,3 +6,10 @@ tools/
 
 # Nested git repo (original grammar source)
 grammars-v4/
+
+# IDE
+.idea/
+.vscode/
+
+# Bundle files
+*.bundle
