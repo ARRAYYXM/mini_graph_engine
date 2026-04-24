@@ -1,0 +1,8 @@
+# ANTLR tools & generated artifacts
+tools/
+*.bak
+*.interp
+*.tokens
+
+# Nested git repo (original grammar source)
+grammars-v4/
